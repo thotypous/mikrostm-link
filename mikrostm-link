@@ -1,0 +1,267 @@
+#!/usr/bin/python
+import sys, os, re, subprocess, struct
+from binascii import unhexlify, hexlify
+from glob import glob
+
+FLASH_BASE = 0x08000000
+RAM_BASE   = 0x20000000
+FLASH_SIZE = 1024*1024
+RAM_SIZE   = 128*1024   # does not include CCM!
+GCC_PREFIX = 'arm-none-eabi-'
+
+def find_file(path, pattern):
+    filename = glob(os.path.join(path, pattern))
+    if len(filename) != 1:
+        sys.stderr.write('directory "%s" must contain a single %s file\n' % (path, pattern))
+        sys.exit(1)
+    return filename[0]
+
+def hexfile_iter(f):
+    lineno, base_addr = 0, 0
+    for line in f.xreadlines():
+        lineno += 1
+        line = line.strip()
+        if line == '':
+            continue
+        assert(line[0] == ':')
+        line = unhexlify(line[1:])
+        byte_count, address, record_type = struct.unpack('>BHB', line[:4])
+        assert(len(line) == byte_count + 5)
+        assert(sum(map(ord,line)) & 0xFF == 0)
+        data = line[4:-1]
+        if record_type == 0x00:    # data record
+            yield (lineno, base_addr + address, data)
+        elif record_type == 0x01:  # end of file record
+            break
+        elif record_type == 0x04:  # extended linear address record
+            base_addr, = struct.unpack('>H', data)
+            base_addr <<= 16
+        elif record_type == 0x02:  # extended segment address record (used only by ld)
+            base_addr, = struct.unpack('>H', data)
+            base_addr <<= 4
+        elif record_type not in [0x03, 0x05]:  # used by ld for the initial PC
+            raise IOError('unknown record type at line %d' % lineno)
+        
+def hexfile_lastaddr(f):
+    lastaddr = -1
+    for lineno, address, data in hexfile_iter(f):
+        address += len(data)
+        assert(address > lastaddr)
+        lastaddr = address
+    assert(lastaddr >= 0)
+    return lastaddr
+
+def hexfile_patch_filter(gen, patch_list):
+    i = 0
+    patch_list.sort()
+    for lineno, address, data in gen:
+        data = bytearray(data)
+        while i < len(patch_list):
+            patch_addr, symbol_addr, symbol_name = patch_list[i]
+            if patch_addr >= address + len(data):  # patch after block
+                break
+            assert(patch_addr + 4 > address)  # current patch was not skipped
+            symbol_addr = struct.pack('<L', symbol_addr)
+            patch_start = patch_addr - address
+            patch_end = min(patch_start + 4, len(data))
+            if patch_start >= 0:   # patch begins after start of the block
+                sys.stderr.write('Patching byte %3d after addr 0x%08x (line %7d): "%s" -> "%s" [%s]\n' % (
+                    patch_start, address, lineno,
+                    hexlify(data[patch_start:patch_end]),
+                    hexlify(symbol_addr[:patch_end-patch_start]),
+                    symbol_name))
+                data[patch_start:patch_end] = symbol_addr[:patch_end-patch_start]
+            else:   # patch begins before start of the block
+                sys.stderr.write('Patching byte   0 after addr 0x%08x (line %7d): "%s" -> "%s" [%s]\n' % (
+                    address, lineno,
+                    hexlify(data[:patch_end]),
+                    hexlify(symbol_addr[-patch_end:]),
+                    symbol_name))
+                data[:patch_end] = symbol_addr[-patch_end:]
+            if patch_addr + 4 > address + len(data):  # patch spans two blocks
+                break  # so, do not try more patches in the current block
+            i += 1
+        yield (lineno, address, data)
+        
+def hexfile_shift_addr_filter(gen, shift_amount):
+    for lineno, address, data in gen:
+        yield (lineno, address + shift_amount, data)
+        
+class HexGenerator:
+    base_addr = 0
+    def __init__(self, outfile):
+        self.f = outfile
+    def _put_line(self, data):
+        data = bytearray(data)
+        checksum = chr((0x100 - (sum(map(int,data)) & 0xFF)) & 0xFF)
+        self.f.write(':' + hexlify(data + checksum).upper() + '\n')
+    def put_end(self):
+        self._put_line(unhexlify('00000001'))
+    def put_base_addr(self, base_addr):
+        assert(base_addr <= 0xFFFF)
+        assert(base_addr >= 0)
+        self.base_addr = base_addr
+        self._put_line(unhexlify('02000004') + struct.pack('>H', base_addr))
+    def feed(self, gen):
+        for _, address, data in gen:
+            base_addr = (address >> 16) & 0xFFFF
+            low_addr = struct.pack('>H', address & 0xFFFF)
+            if base_addr != self.base_addr:
+                self.put_base_addr(base_addr)
+            self._put_line(struct.pack('>B', len(data)) + low_addr + '\x00' + data)
+
+class LSTFile:
+    funcs = {}
+    vars = {}
+    consts = {}
+    def __init__(self, f):
+        state = None
+        for line in f.xreadlines():
+            line = line.strip()
+            if line == '':
+                continue
+            if line == '//** Routines locations **':
+                state = self.funcs
+            elif line == '//** Variables locations **':
+                state = self.vars
+            elif line == '//** Constants locations **':
+                state = self.consts
+            elif state != None and not line.startswith('//'):
+                m = re.match(r'^(0x[0-9A-F]+)\s+\[(\d+)]\s+(.+)$', line)
+                addr, size, name = m.groups()
+                state[name] = (int(addr,16), int(size))
+    @staticmethod
+    def repr_dic(dic):
+        a = []
+        maxname = max(map(len,dic.iterkeys()))
+        for k,v in dic.iteritems():
+            a.append('%s  0x%x [%d]\n'%(k.ljust(maxname), v[0], v[1]))
+        return ''.join(a)
+    def __repr__(self):
+        s  = '[funcs]\n'  + LSTFile.repr_dic(self.funcs ) + '\n\n'
+        s += '[vars]\n'   + LSTFile.repr_dic(self.vars  ) + '\n\n'
+        s += '[consts]\n' + LSTFile.repr_dic(self.consts) + '\n'
+        return s
+
+def align(addr, alignment):
+    misalignment = addr % alignment
+    if misalignment != 0:
+        addr += alignment - misalignment
+    return addr
+    
+def create_ldscript(rom_start, ram_start):
+    rom_start = align(rom_start, 0x10)
+    ram_start = align(ram_start, 0x04)
+    rom_size = FLASH_SIZE - rom_start
+    ram_size = RAM_SIZE - (ram_start - RAM_BASE)
+    return """MEMORY
+{
+    rom (rx) : ORIGIN = 0x%x, LENGTH = 0x%x
+    ram (rwx) : ORIGIN = 0x%x, LENGTH = 0x%x
+}
+""" % (rom_start, rom_size, ram_start, ram_size)
+
+def write_contents(filename, contents):
+    f = open(filename, 'w')
+    f.write(contents)
+    f.close()
+
+def solve_imports(lines, lst):
+    imported_funcs, imported_vars = {}, {}
+    for i, line in enumerate(lines):
+        sline = line.strip()
+        symbol = None
+        m = re.match(r'^static[^(]+\(\s*\*\s*const\s+(.+?)\s*\)', sline)
+        if m:
+            symbol = m.group(1).strip()
+            addr, size = lst.funcs['_'+symbol]
+            addr |= 1  # mark as Thumb
+            imported_funcs[symbol] = (addr, size)
+        else:
+            m = re.match(r'^static.+?\*\s*const\s+([^;=]+)', sline)
+            if m:
+                symbol = m.group(1).strip()
+                addr, size = lst.vars['_'+symbol]
+                imported_vars[symbol] = (addr, size)
+        if symbol:
+            assert(';' in line)
+            newstr = ' = (void*)0x%x;'%addr
+            if '=' in line:
+                line = re.sub(r'\s*=[^;]+;', newstr, line, 1);
+            else:
+                line = line.replace(';', newstr, 1)
+            lines[i] = line
+    sys.stderr.write('Symbols imported by the gcc project:\n\n[funcs]\n')
+    sys.stderr.write(LSTFile.repr_dic(imported_funcs))
+    sys.stderr.write('\n[vars]\n')
+    sys.stderr.write(LSTFile.repr_dic(imported_vars))
+    sys.stderr.write('\n')
+    return ''.join(lines)
+
+def get_elf_symbols(elfpath):
+    tbl = {}
+    p = subprocess.Popen([GCC_PREFIX + 'nm', '-g', elfpath], stdout=subprocess.PIPE)
+    for line in p.stdout.xreadlines():
+        addr, flag, symbol = re.split('\s+', line.strip(), 2)
+        tbl[symbol] = int('0x'+addr, 16)
+    return tbl
+
+def get_export_list(ldscript):
+    l = ['reset_handler']
+    for line in ldscript.xreadlines():
+        m = re.match('^EXTERN\s*\((.+?)\)', line.strip())
+        if m: l.append(m.group(1).strip())
+    return set(l)
+
+def get_patch_list(export_list, elf_symbols, lst):
+    l = []
+    for symbol in export_list:
+        symbol_addr  = elf_symbols[symbol]
+        symbol_addr |= 1   # mark as Thumb
+        patch_addr, _ = lst.consts['?ICS_'+symbol]
+        l.append((FLASH_BASE + patch_addr, symbol_addr, symbol))
+    return l
+
+if len(sys.argv) != 3:
+    sys.stderr.write('usage: %s mikroc-project-dir gcc-project-dir\n' % sys.argv[0])
+    sys.exit(1)
+
+dir_mikroc, dir_gcc = map(os.path.realpath, sys.argv[1:])
+
+mikroc_hex = find_file(dir_mikroc, '*.hex')
+mikroc_last_flashaddr = hexfile_lastaddr(open(mikroc_hex))
+mikroc_lst = LSTFile(open(find_file(dir_mikroc, '*.lst')))
+mikroc_last_varaddr = max([v[0]+v[1] for v in mikroc_lst.vars.itervalues()])
+
+assert(mikroc_last_flashaddr > FLASH_BASE)
+mikroc_last_flashaddr -= FLASH_BASE
+assert(mikroc_last_varaddr > RAM_BASE)
+
+sys.stderr.write('mikroC symbol tables:\n\n')
+sys.stderr.write(repr(mikroc_lst))
+sys.stderr.write('\nmikroC last Flash address: 0x%x\n' % mikroc_last_flashaddr)
+sys.stderr.write('mikroC last variable address: 0x%x\n\n' % mikroc_last_varaddr)
+
+os.chdir(dir_gcc)
+write_contents('memory_map.ld', create_ldscript(mikroc_last_flashaddr, mikroc_last_varaddr))
+write_contents('imports.h', solve_imports(open('imports.h').readlines(), mikroc_lst))
+
+sys.stderr.write('Running make\n')
+p = subprocess.Popen(['make'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+for line in p.stdout.xreadlines():
+    sys.stderr.write(line)
+assert(p.wait() == 0)
+
+gcc_elf_output = find_file(dir_gcc, '*.elf')
+gcc_hex_output = os.path.splitext(gcc_elf_output)[0] + '.hex'
+assert(os.path.exists(gcc_hex_output))
+
+sys.stderr.write('\n\n')
+elf_symbols = get_elf_symbols(gcc_elf_output)
+export_list = get_export_list(open('exports.ld'))
+patch_list = get_patch_list(export_list, elf_symbols, mikroc_lst)
+
+hexgen = HexGenerator(sys.stdout)
+hexgen.feed(hexfile_patch_filter(hexfile_iter(open(mikroc_hex)), patch_list))
+hexgen.feed(hexfile_shift_addr_filter(hexfile_iter(open(gcc_hex_output)), FLASH_BASE))
+hexgen.put_end()
